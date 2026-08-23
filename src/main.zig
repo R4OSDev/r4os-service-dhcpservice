@@ -4,6 +4,9 @@ const service_name = "DHCPSVC";
 const selftest_arg = "/SELFTEST";
 const ping_arg = "/PING";
 const dhcp_service_timeout_ms: u64 = 1000;
+const dhcp_action_timeout_ms: u64 = 5000;
+
+var kernel_response_buffer: [r4os.abi.ipc_max_message_size]u8 = .{0xA5} ** r4os.abi.ipc_max_message_size;
 
 const LeaseTiming = struct {
     elapsed_seconds: u32 = 0,
@@ -107,11 +110,12 @@ fn handleRequest(app: *const App, handle: u32, state: *DhcpServiceState) i32 {
     if (got == 0 and header.magic != r4os.abi.service_api_magic) return 0;
 
     state.requests +%= 1;
+    const request = payload[0..@as(usize, @intCast(got))];
     return switch (header.op) {
         r4os.abi.net_service_op_status => replyTextStatus(app, handle, header.request_id, state),
         r4os.abi.net_service_op_dhcp_status_result => replyStatusResult(app, handle, header.request_id, state),
-        r4os.abi.net_service_op_dhcp_acquire, r4os.abi.net_service_op_dhcp_renew, r4os.abi.net_service_op_dhcp_release => replyActionText(app, handle, header.request_id, header.op, state),
-        r4os.abi.net_service_op_dhcp_acquire_result, r4os.abi.net_service_op_dhcp_renew_result, r4os.abi.net_service_op_dhcp_release_result => replyActionResult(app, handle, header.request_id, header.op, state),
+        r4os.abi.net_service_op_dhcp_acquire, r4os.abi.net_service_op_dhcp_renew, r4os.abi.net_service_op_dhcp_release => replyActionText(app, handle, header.request_id, header.op, request, state),
+        r4os.abi.net_service_op_dhcp_acquire_result, r4os.abi.net_service_op_dhcp_renew_result, r4os.abi.net_service_op_dhcp_release_result => replyActionResult(app, handle, header.request_id, header.op, request, state),
         else => {
             state.bad_ops +%= 1;
             return app.sys.serviceEndpointReply(handle, header.request_id, r4os.abi.service_api_result_bad_op, "BADOP");
@@ -136,32 +140,29 @@ fn replyStatusResult(app: *const App, handle: u32, request_id: u32, state: *Dhcp
     return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.NetServiceDhcpStatus)]);
 }
 
-fn replyActionText(app: *const App, handle: u32, request_id: u32, op: u16, state: *DhcpServiceState) i32 {
-    const result = performAction(app, state, op);
+fn replyActionText(app: *const App, handle: u32, request_id: u32, op: u16, request: []const u8, state: *DhcpServiceState) i32 {
+    const result = performAction(app, state, op, request);
     var buf: [512]u8 = .{0} ** 512;
     var w = Writer{ .out = buf[0..] };
     writeActionText(&w, app, state, result);
     return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, w.slice());
 }
 
-fn replyActionResult(app: *const App, handle: u32, request_id: u32, op: u16, state: *DhcpServiceState) i32 {
-    const result = performAction(app, state, op);
+fn replyActionResult(app: *const App, handle: u32, request_id: u32, op: u16, request: []const u8, state: *DhcpServiceState) i32 {
+    const result = performAction(app, state, op, request);
     const bytes: [*]const u8 = @ptrCast(&result);
     return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.NetServiceDhcpResult)]);
 }
 
-fn performAction(app: *const App, state: *DhcpServiceState, op: u16) r4os.abi.NetServiceDhcpResult {
+fn performAction(app: *const App, state: *DhcpServiceState, op: u16, request: []const u8) r4os.abi.NetServiceDhcpResult {
     const action = actionForOp(op);
     state.action_requests +%= 1;
     state.operation_pending = true;
     copyFixed(state.pending_label[0..], actionName(action));
 
-    const tx = switch (action) {
-        r4os.abi.net_service_dhcp_action_acquire => app.net.netDhcpAcquire(),
-        r4os.abi.net_service_dhcp_action_renew => app.net.netDhcpRenew(),
-        r4os.abi.net_service_dhcp_action_release => app.net.netDhcpRelease(),
-        else => r4os.abi.net_tx_backend_error,
-    };
+    const view = r4os.service_deadline.split(request);
+    const deadline_tick = view.deadline_tick orelse app.sys.ticks() +| app.sys.ticksFromMilliseconds(dhcp_action_timeout_ms);
+    const tx = performKernelAction(app, action, deadline_tick);
 
     state.operation_pending = false;
     copyFixed(state.pending_label[0..], "idle");
@@ -178,6 +179,26 @@ fn performAction(app: *const App, state: *DhcpServiceState, op: u16) r4os.abi.Ne
     }
 
     return makeActionResult(app, state, action, state.last_result);
+}
+
+fn performKernelAction(app: *const App, action: u16, deadline_tick: u64) i32 {
+    const op: u16 = switch (action) {
+        r4os.abi.net_service_dhcp_action_acquire => r4os.abi.net_service_op_dhcp_acquire_result,
+        r4os.abi.net_service_dhcp_action_renew => r4os.abi.net_service_op_dhcp_renew_result,
+        r4os.abi.net_service_dhcp_action_release => r4os.abi.net_service_op_dhcp_release_result,
+        else => return r4os.abi.net_tx_backend_error,
+    };
+    var request: [r4os.service_deadline.footer_size]u8 = undefined;
+    const payload = r4os.service_deadline.append(request[0..], "", deadline_tick) orelse return r4os.abi.net_tx_backend_error;
+    const got = app.net.netServiceRequest(r4os.abi.ipc_channel_net_dhcp, op, 0x44504344, payload, kernel_response_buffer[0..]);
+    if (got <= 0) return r4os.abi.net_tx_backend_error;
+    var status: i32 = 0;
+    const response = app.net.netServicePayload(kernel_response_buffer[0..@intCast(got)], &status) orelse return r4os.abi.net_tx_backend_error;
+    if (status != r4os.abi.net_service_result_ok or response.len < @sizeOf(r4os.abi.NetServiceDhcpResult)) return r4os.abi.net_tx_backend_error;
+    var result = r4os.abi.NetServiceDhcpResult{};
+    copyStruct(&result, response[0..@sizeOf(r4os.abi.NetServiceDhcpResult)]);
+    if (result.magic != r4os.abi.net_service_dhcp_result_magic or result.version != r4os.abi.net_service_dhcp_result_version) return r4os.abi.net_tx_backend_error;
+    return normalizeNetTxCode(result.result);
 }
 
 fn refreshStatus(app: *const App, state: *DhcpServiceState) bool {
