@@ -118,7 +118,7 @@ fn handleRequest(app: *const App, handle: u32, state: *DhcpServiceState) i32 {
         r4os.abi.net_service_op_dhcp_acquire_result, r4os.abi.net_service_op_dhcp_renew_result, r4os.abi.net_service_op_dhcp_release_result => replyActionResult(app, handle, header.request_id, header.op, request, state),
         else => {
             state.bad_ops +%= 1;
-            return app.sys.serviceEndpointReply(handle, header.request_id, r4os.abi.service_api_result_bad_op, "BADOP");
+            return r4os.app_services.replyIfPending(app.sys, handle, header.request_id, r4os.abi.service_api_result_bad_op, "BADOP");
         },
     };
 }
@@ -129,7 +129,7 @@ fn replyTextStatus(app: *const App, handle: u32, request_id: u32, state: *DhcpSe
     var buf: [512]u8 = .{0} ** 512;
     var w = Writer{ .out = buf[0..] };
     writeStatusText(&w, app, state);
-    return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, w.slice());
+    return r4os.app_services.replyIfPending(app.sys, handle, request_id, r4os.abi.service_api_result_ok, w.slice());
 }
 
 fn replyStatusResult(app: *const App, handle: u32, request_id: u32, state: *DhcpServiceState) i32 {
@@ -137,7 +137,7 @@ fn replyStatusResult(app: *const App, handle: u32, request_id: u32, state: *Dhcp
     _ = refreshStatus(app, state);
     const status = makeStatusResult(app, state);
     const bytes: [*]const u8 = @ptrCast(&status);
-    return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.NetServiceDhcpStatus)]);
+    return r4os.app_services.replyIfPending(app.sys, handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.NetServiceDhcpStatus)]);
 }
 
 fn replyActionText(app: *const App, handle: u32, request_id: u32, op: u16, request: []const u8, state: *DhcpServiceState) i32 {
@@ -145,13 +145,13 @@ fn replyActionText(app: *const App, handle: u32, request_id: u32, op: u16, reque
     var buf: [512]u8 = .{0} ** 512;
     var w = Writer{ .out = buf[0..] };
     writeActionText(&w, app, state, result);
-    return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, w.slice());
+    return r4os.app_services.replyIfPending(app.sys, handle, request_id, r4os.abi.service_api_result_ok, w.slice());
 }
 
 fn replyActionResult(app: *const App, handle: u32, request_id: u32, op: u16, request: []const u8, state: *DhcpServiceState) i32 {
     const result = performAction(app, state, op, request);
     const bytes: [*]const u8 = @ptrCast(&result);
-    return app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.NetServiceDhcpResult)]);
+    return r4os.app_services.replyIfPending(app.sys, handle, request_id, r4os.abi.service_api_result_ok, bytes[0..@sizeOf(r4os.abi.NetServiceDhcpResult)]);
 }
 
 fn performAction(app: *const App, state: *DhcpServiceState, op: u16, request: []const u8) r4os.abi.NetServiceDhcpResult {
