@@ -25,10 +25,7 @@ const DhcpServiceState = struct {
     pending_label: [16]u8 = .{0} ** 16,
     last_result: i32 = r4os.abi.net_tx_backend_error,
     last_status_valid: bool = false,
-    last_status: r4os.abi.DhcpStatus = .{},
-    lease_start_tick: u64 = 0,
-    tracked_xid: u32 = 0,
-    tracked_ip: [4]u8 = .{0} ** 4,
+    last_status: r4os.abi.NetServiceDhcpStatus = .{},
     last_error: [32]u8 = .{0} ** 32,
 };
 
@@ -169,15 +166,6 @@ fn performAction(app: *const App, state: *DhcpServiceState, op: u16, request: []
     state.last_result = normalizeNetTxCode(tx);
     if (!refreshStatus(app, state)) copyFixed(state.last_error[0..], app.net.netTxResultName(state.last_result));
 
-    if (state.last_status_valid) {
-        const bound = (state.last_status.flags & r4os.abi.dhcp_status_flag_bound) != 0;
-        if ((action == r4os.abi.net_service_dhcp_action_acquire or action == r4os.abi.net_service_dhcp_action_renew) and state.last_result == r4os.abi.net_tx_ok and bound) {
-            markLeaseTracked(app, state, &state.last_status, true);
-        } else if (action == r4os.abi.net_service_dhcp_action_release and !bound) {
-            clearLeaseTracked(state);
-        }
-    }
-
     return makeActionResult(app, state, action, state.last_result);
 }
 
@@ -202,41 +190,29 @@ fn performKernelAction(app: *const App, action: u16, deadline_tick: u64) i32 {
 }
 
 fn refreshStatus(app: *const App, state: *DhcpServiceState) bool {
-    var raw: r4os.abi.DhcpStatus = .{};
-    const rc = app.net.netDhcpStatus(&raw);
-    if (rc <= 0) {
-        state.last_status_valid = false;
+    // This is the kernel IPC channel, not the DHCPSVC endpoint. Its existing
+    // structured response includes timings from the actual bound lease.
+    state.last_status_valid = false;
+    const got = app.net.netServiceRequest(r4os.abi.ipc_channel_net_dhcp, r4os.abi.net_service_op_dhcp_status_result, 0x44504353, "", kernel_response_buffer[0..]);
+    if (got <= 0) {
         copyFixed(state.last_error[0..], "status-unavailable");
         return false;
     }
+    var status: i32 = 0;
+    const response = app.net.netServicePayload(kernel_response_buffer[0..@intCast(got)], &status) orelse return false;
+    if (status != r4os.abi.net_service_result_ok or response.len != @sizeOf(r4os.abi.NetServiceDhcpStatus)) return false;
+    var raw: r4os.abi.NetServiceDhcpStatus = .{};
+    copyStruct(&raw, response);
+    if (raw.magic != r4os.abi.net_service_dhcp_status_magic or raw.version != r4os.abi.net_service_dhcp_status_version) return false;
     state.last_status = raw;
     state.last_status_valid = true;
     if (spanZ(raw.last_error[0..]).len != 0) copyFixed(state.last_error[0..], spanZ(raw.last_error[0..]));
-    markLeaseTracked(app, state, &raw, false);
     return true;
 }
 
-fn markLeaseTracked(app: *const App, state: *DhcpServiceState, raw: *const r4os.abi.DhcpStatus, force_start: bool) void {
-    const bound = (raw.flags & r4os.abi.dhcp_status_flag_bound) != 0;
-    if (!bound) {
-        clearLeaseTracked(state);
-        return;
-    }
-    const changed = state.tracked_xid != raw.xid or !sameIp(state.tracked_ip, raw.offered_ip);
-    if (force_start or state.lease_start_tick == 0 or changed) state.lease_start_tick = app.sys.ticks();
-    state.tracked_xid = raw.xid;
-    state.tracked_ip = raw.offered_ip;
-}
-
-fn clearLeaseTracked(state: *DhcpServiceState) void {
-    state.lease_start_tick = 0;
-    state.tracked_xid = 0;
-    state.tracked_ip = .{0} ** 4;
-}
-
-fn makeStatusResult(app: *const App, state: *const DhcpServiceState) r4os.abi.NetServiceDhcpStatus {
+fn makeStatusResult(_: *const App, state: *const DhcpServiceState) r4os.abi.NetServiceDhcpStatus {
     const raw = state.last_status;
-    const timing = leaseTiming(app, state, raw);
+    const timing = leaseTiming(raw);
     var out = r4os.abi.NetServiceDhcpStatus{
         .runtime_state = raw.runtime_state,
         .flags = serviceDhcpFlags(state, raw),
@@ -272,9 +248,9 @@ fn makeStatusResult(app: *const App, state: *const DhcpServiceState) r4os.abi.Ne
     return out;
 }
 
-fn makeActionResult(app: *const App, state: *const DhcpServiceState, action: u16, result: i32) r4os.abi.NetServiceDhcpResult {
+fn makeActionResult(_: *const App, state: *const DhcpServiceState, action: u16, result: i32) r4os.abi.NetServiceDhcpResult {
     const raw = state.last_status;
-    const timing = leaseTiming(app, state, raw);
+    const timing = leaseTiming(raw);
     var flags = serviceDhcpFlags(state, raw);
     flags = withServiceStatus(flags, serviceStatusFromTxResult(result, spanZ(state.last_error[0..])));
     return .{
@@ -306,31 +282,25 @@ fn makeActionResult(app: *const App, state: *const DhcpServiceState, action: u16
     };
 }
 
-fn leaseTiming(app: *const App, state: *const DhcpServiceState, raw: r4os.abi.DhcpStatus) LeaseTiming {
-    if ((raw.flags & r4os.abi.dhcp_status_flag_bound) == 0 or state.lease_start_tick == 0) return .{};
-    const hz = app.sys.monotonicHz();
-    if (hz == 0) return .{};
-    const now = app.sys.ticks();
-    const elapsed_ticks = if (now > state.lease_start_tick) now - state.lease_start_tick else 0;
-    const elapsed_u64 = elapsed_ticks / hz;
-    const elapsed: u32 = if (elapsed_u64 > 0xFFFF_FFFF) 0xFFFF_FFFF else @intCast(elapsed_u64);
+fn leaseTiming(raw: r4os.abi.NetServiceDhcpStatus) LeaseTiming {
+    if ((raw.flags & r4os.abi.net_service_dhcp_flag_bound) == 0) return .{};
     return .{
-        .elapsed_seconds = elapsed,
-        .remaining_seconds = secondsRemaining(raw.lease_seconds, elapsed),
-        .renew_in_seconds = secondsRemaining(raw.renew_seconds, elapsed),
-        .rebind_in_seconds = secondsRemaining(raw.rebind_seconds, elapsed),
+        .elapsed_seconds = raw.elapsed_seconds,
+        .remaining_seconds = raw.remaining_seconds,
+        .renew_in_seconds = raw.renew_in_seconds,
+        .rebind_in_seconds = raw.rebind_in_seconds,
     };
 }
 
-fn serviceDhcpFlags(state: *const DhcpServiceState, raw: r4os.abi.DhcpStatus) u32 {
+fn serviceDhcpFlags(state: *const DhcpServiceState, raw: r4os.abi.NetServiceDhcpStatus) u32 {
     var flags: u32 = 0;
-    if ((raw.flags & r4os.abi.dhcp_status_flag_bound) != 0) flags |= r4os.abi.net_service_dhcp_flag_bound;
-    if ((raw.flags & r4os.abi.dhcp_status_flag_dns_configured) != 0) flags |= r4os.abi.net_service_dhcp_flag_dns_configured;
-    if (state.operation_pending or (raw.flags & r4os.abi.dhcp_status_flag_pending) != 0) flags |= r4os.abi.net_service_dhcp_flag_pending;
-    if ((raw.flags & r4os.abi.dhcp_status_flag_desired) != 0) flags |= r4os.abi.net_service_dhcp_flag_desired;
-    if ((raw.flags & r4os.abi.dhcp_status_flag_task_started) != 0) flags |= r4os.abi.net_service_dhcp_flag_task_started;
-    if ((raw.flags & r4os.abi.dhcp_status_flag_link_up) != 0) flags |= r4os.abi.net_service_dhcp_flag_link_up;
-    if ((raw.flags & r4os.abi.dhcp_status_flag_retry_wait) != 0) flags |= r4os.abi.net_service_dhcp_flag_retry_wait;
+    if ((raw.flags & r4os.abi.net_service_dhcp_flag_bound) != 0) flags |= r4os.abi.net_service_dhcp_flag_bound;
+    if ((raw.flags & r4os.abi.net_service_dhcp_flag_dns_configured) != 0) flags |= r4os.abi.net_service_dhcp_flag_dns_configured;
+    if (state.operation_pending or (raw.flags & r4os.abi.net_service_dhcp_flag_pending) != 0) flags |= r4os.abi.net_service_dhcp_flag_pending;
+    if ((raw.flags & r4os.abi.net_service_dhcp_flag_desired) != 0) flags |= r4os.abi.net_service_dhcp_flag_desired;
+    if ((raw.flags & r4os.abi.net_service_dhcp_flag_task_started) != 0) flags |= r4os.abi.net_service_dhcp_flag_task_started;
+    if ((raw.flags & r4os.abi.net_service_dhcp_flag_link_up) != 0) flags |= r4os.abi.net_service_dhcp_flag_link_up;
+    if ((raw.flags & r4os.abi.net_service_dhcp_flag_retry_wait) != 0) flags |= r4os.abi.net_service_dhcp_flag_retry_wait;
     return flags;
 }
 
@@ -352,11 +322,11 @@ fn actionName(action: u16) []const u8 {
     };
 }
 
-fn writeStatusText(w: *Writer, app: *const App, state: *const DhcpServiceState) void {
+fn writeStatusText(w: *Writer, _: *const App, state: *const DhcpServiceState) void {
     const raw = state.last_status;
-    const timing = leaseTiming(app, state, raw);
+    const timing = leaseTiming(raw);
     w.text("state=");
-    w.text(if ((raw.flags & r4os.abi.dhcp_status_flag_bound) != 0) "bound" else "released");
+    w.text(if ((raw.flags & r4os.abi.net_service_dhcp_flag_bound) != 0) "bound" else "released");
     w.text(" pending=");
     w.text(if ((serviceDhcpFlags(state, raw) & r4os.abi.net_service_dhcp_flag_pending) != 0) "yes" else "no");
     w.text(" op=");
@@ -512,24 +482,25 @@ fn localContractSelfTest(app: *const App) bool {
         .lease_seconds = 120,
         .renew_seconds = 60,
         .rebind_seconds = 105,
-        .flags = r4os.abi.dhcp_status_flag_bound | r4os.abi.dhcp_status_flag_dns_configured |
-            r4os.abi.dhcp_status_flag_desired | r4os.abi.dhcp_status_flag_task_started |
-            r4os.abi.dhcp_status_flag_link_up,
+        .flags = r4os.abi.net_service_dhcp_flag_bound | r4os.abi.net_service_dhcp_flag_dns_configured |
+            r4os.abi.net_service_dhcp_flag_desired | r4os.abi.net_service_dhcp_flag_task_started |
+            r4os.abi.net_service_dhcp_flag_link_up,
         .last_attempt = 2,
         .last_type = 5,
         .runtime_state = 6,
     };
     copyFixed(state.last_status.last_error[0..], "bound");
-    state.lease_start_tick = app.sys.ticks();
-    state.tracked_xid = state.last_status.xid;
-    state.tracked_ip = state.last_status.offered_ip;
+    state.last_status.elapsed_seconds = 30;
+    state.last_status.remaining_seconds = 90;
+    state.last_status.renew_in_seconds = 30;
+    state.last_status.rebind_in_seconds = 75;
 
     const status = makeStatusResult(app, &state);
     if (status.magic != r4os.abi.net_service_dhcp_status_magic or status.version != r4os.abi.net_service_dhcp_status_version) return false;
     if ((status.flags & r4os.abi.net_service_dhcp_flag_bound) == 0 or (status.flags & r4os.abi.net_service_dhcp_flag_dns_configured) == 0) return false;
     if ((status.flags & r4os.abi.net_service_dhcp_flag_desired) == 0 or (status.flags & r4os.abi.net_service_dhcp_flag_task_started) == 0 or (status.flags & r4os.abi.net_service_dhcp_flag_link_up) == 0) return false;
     if (status.runtime_state != 6) return false;
-    if (status.lease_seconds != 120 or status.remaining_seconds != 120 or status.renew_in_seconds != 60) return false;
+    if (status.lease_seconds != 120 or status.elapsed_seconds != 30 or status.remaining_seconds != 90 or status.renew_in_seconds != 30 or status.rebind_in_seconds != 75) return false;
     if (!sameIp(status.offered_ip, .{ 10, 0, 2, 15 }) or !sameIp(status.dns_ip, .{ 10, 0, 2, 3 })) return false;
 
     const ok = makeActionResult(app, &state, r4os.abi.net_service_dhcp_action_acquire, r4os.abi.net_tx_ok);

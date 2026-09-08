@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.3`
+- Version: `0.1.5`
 - Image target: `/R4OS/SERVICES/DHCPSVC.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -38,3 +38,9 @@ Detailed German technical notes from the migration are preserved in
 Original R4OS material is licensed under Apache License 2.0. See `LICENSE`
 and `NOTICE`. Any repository-specific external material is documented in
 `THIRD_PARTY_NOTICES.md`.
+
+
+DHCPSVC reads the existing structured kernel DHCP IPC status, including lease
+elapsed/remaining times. Restarting the service no longer invents a new lease
+start time. The raw status API and service response layouts remain unchanged.
+The existing local status self-test uses an already aged lease.
